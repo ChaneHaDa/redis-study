@@ -9,7 +9,13 @@ docker-compose up -d
 
 ### Redis CLI 접속
 ```bash
+# 대화형 CLI 접속
 docker exec -it redis-study redis-cli
+
+# 일회성 명령어 실행
+docker exec redis-study redis-cli PING
+docker exec redis-study redis-cli SET key "value"
+docker exec redis-study redis-cli GET key
 ```
 
 ### Redis Insight GUI 접속
