@@ -1,0 +1,32 @@
+spring:
+  application:
+    name: redis-study-spring
+
+  # Redis 연결 설정
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+
+# Swagger/OpenAPI 설정
+springdoc:
+  swagger-ui:
+    path: /docs  # 스웨거 UI 경로를 /docs로 변경
+  api-docs:
+    path: /docs/api-docs  # API 문서 경로도 함께 변경
+
+# 서버 포트 설정
+server:
+  port: 8080
+
+# 로깅 설정
+logging:
+  level:
+    com.redis.study: DEBUG
+    org.springframework.data.redis: DEBUG
