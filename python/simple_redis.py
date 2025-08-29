@@ -1,102 +1,95 @@
-# redis_basics.py
+"""
+실제 Redis 서버에 연결해서 basic 명령들을 실행하는 데모.
+
+사전 준비:
+- Redis 서버가 로컬 6379에서 실행 중이거나, 환경변수 REDIS_URL 제공
+  예) REDIS_URL=redis://:password@localhost:6379/0
+
+설치:
+pip install redis
+
+실행:
+python real_redis_demo.py
+"""
+
+from __future__ import annotations
+import os
+import time
+from typing import Any
+
 import redis
-from redis.exceptions import WatchError
 
-# 1) 연결
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
-# ---------- Hash 기본 (작은 객체/Map) ----------
-def set_user(user_id: int, **fields):
-    key = f"user:{user_id}"
-    # HSET user:1 name "Haechan" role "backend" 처럼
-    if fields:
-        r.hset(key, mapping=fields)
-
-def get_user(user_id: int):
-    return r.hgetall(f"user:{user_id}")
-
-# ---------- 딱 100장: WATCH/MULTI/EXEC (Lua 없이 안전) ----------
-def try_issue_tx(key: str, limit: int, max_retries: int = 10):
+def get_redis_client() -> redis.Redis:
+    """Redis 클라이언트를 생성해 반환합니다.
+    - 환경변수 REDIS_URL이 있으면 그 값을 사용합니다.
+    - 없으면 로컬 127.0.0.1:6379, DB 0에 접속합니다.
+    - decode_responses=True로 지정해 str 타입으로 응답을 받습니다.
     """
-    - key: "coupon:today:count" 처럼 누적 카운터 키
-    - limit: 100 등
-    - 반환: (ok, seq_or_curr)
-        ok=True  → 발급 성공, seq_or_curr=발급된 순번(1..limit)
-        ok=False → 매진, seq_or_curr=현재 누적 수(>=limit)
-    """
-    for _ in range(max_retries):
-        pipe = r.pipeline()
-        try:
-            pipe.watch(key)                         # 다른 변경 감시
-            curr = int(r.get(key) or "0")
-            if curr >= limit:
-                pipe.unwatch()
-                return False, curr                  # 매진
+    url = os.getenv("REDIS_URL")
+    if url:
+        return redis.Redis.from_url(url, decode_responses=True)
+    # 로컬 기본값
+    return redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
 
-            pipe.multi()                            # 트랜잭션 시작
-            pipe.incr(key)                          # INCR
-            res = pipe.execute()                    # 커밋 (충돌 시 WatchError)
-            next_val = int(res[0])                  # INCR 결과
-            return True, next_val
-        except WatchError:
-            # 경합 발생 → 재시도
-            continue
-        finally:
-            pipe.reset()
 
-    # 재시도 초과
-    return False, int(r.get(key) or "0")
+def main() -> None:
+    """실제 Redis에 연결해서 기본 명령들을 순차적으로 실행하는 데모."""
+    r = get_redis_client()
+    # 연결 확인 (PING)
+    print("PING ->", r.ping())
 
-# ---------- 딱 100장: DECR 방식 (간단; 원복 필수) ----------
-def try_issue_decr(key_remain: str):
-    """
-    - key_remain: "coupon:today:remain" 처럼 남은 수량 키 (초기값 100)
-    - 반환: (ok, remaining_after)
-        ok=True  → 성공, remaining_after=발급 후 남은 수량(>=0)
-        ok=False → 실패, remaining_after=음수(즉시 INCR로 복구)
-    """
-    val = r.decr(key_remain)          # 남은 수량 1 감소
-    if val >= 0:
-        return True, val              # 성공
-    # 음수면 초과 → 즉시 복구
-    r.incr(key_remain)
-    return False, val
+    print("\n== String + TTL ==")
+    # ex=2 로 2초 뒤 만료되도록 설정
+    r.set("greet", "hello", ex=2)
+    print("GET greet ->", r.get("greet"))
+    print("TTL greet ->", r.ttl("greet"))
+    # 만료 확인을 위해 2초보다 약간 더 대기
+    time.sleep(2.1)
+    print("TTL greet (after sleep) ->", r.ttl("greet"))
+    print("GET greet (after expire) ->", r.get("greet"))
 
-# ---------- 랭킹 보드 (ZSET) ----------
-def add_score(board: str, member: str, delta: float):
-    r.zincrby(f"rank:{board}", delta, member)
+    print("\n== INCR/DECR ==")
+    # 실험을 위해 기존 키 제거
+    r.delete("count")
+    print("INCR count ->", r.incr("count"))
+    print("INCR count ->", r.incr("count", 10))
+    print("DECR count ->", r.decr("count"))
 
-def top_n(board: str, n: int = 3):
-    # 높은 점수 우선
-    return r.zrevrange(f"rank:{board}", 0, n - 1, withscores=True)
+    print("\n== Hash ==")
+    # 해시 키 초기화 후 필드 설정
+    r.delete("user:42")
+    print("HSET user:42 ->", r.hset("user:42", mapping={"name": "해찬", "role": "backend"}))
+    print("HINCRBY user:42 posts ->", r.hincrby("user:42", "posts", 1))
+    print("HGETALL user:42 ->", r.hgetall("user:42"))
 
-# ---------- 간단 실행 데모 ----------
+    print("\n== List (recent 5) ==")
+    # 최근 5개만 유지하는 리스트 패턴 (LPUSH + LTRIM)
+    r.delete("recent:42")
+    for i in range(1, 8):
+        r.lpush("recent:42", f"post-{i}")
+        r.ltrim("recent:42", 0, 4)  # 최근 5개 유지
+    print("LRANGE recent:42 0 -1 ->", r.lrange("recent:42", 0, -1))
+
+    print("\n== Set ==")
+    # 집합은 중복을 허용하지 않음 (u2는 한 번만 저장)
+    r.delete("viewed:99")
+    print("SADD viewed:99 ->", r.sadd("viewed:99", "u1", "u2", "u2"))
+    # 정렬해 출력하면 확인이 편리함 (Redis는 내부적으로 정렬 보장 안 함)
+    print("SMEMBERS viewed:99 ->", sorted(r.smembers("viewed:99")))
+    print("SISMEMBER viewed:99 u3 ->", r.sismember("viewed:99", "u3"))
+
+    print("\n== Sorted Set (ranking) ==")
+    # 점수(score)로 정렬되는 랭킹 예제
+    r.delete("rank:game")
+    print("ZADD rank:game ->", r.zadd("rank:game", {"alice": 30, "bob": 50}))
+    print("ZINCRBY rank:game carol 15 ->", r.zincrby("rank:game", 15, "carol"))
+    print("ZREVRANGE rank:game 0 2 WITHSCORES ->", r.zrevrange("rank:game", 0, 2, withscores=True))
+
+    print("\nDone.")
+
+
 if __name__ == "__main__":
-    print("== Hash 기초 ==")
-    set_user(42, name="강해찬", role="backend", level="junior")
-    print(get_user(42))  # {'name': '강해찬', 'role': 'backend', 'level': 'junior'}
+    main()
 
-    print("\n== 쿠폰 발급(트랜잭션 방식) ==")
-    counter_key = "coupon:today:count"
-    r.delete(counter_key)
-    limit = 5
-    for _ in range(7):  # 7번 시도해도 5번만 성공
-        ok, v = try_issue_tx(counter_key, limit)
-        print("issue_tx:", ok, v)
-    print("final count:", r.get(counter_key))  # 5
 
-    print("\n== 쿠폰 발급(DECR 방식) ==")
-    remain_key = "coupon:today:remain"
-    r.set(remain_key, 3)
-    for _ in range(5):  # 5번 시도해도 3번만 성공
-        ok, v = try_issue_decr(remain_key)
-        print("issue_decr:", ok, v)
-    print("final remain:", r.get(remain_key))  # 0 또는 복구 덕분에 정확
-
-    print("\n== 랭킹(ZSET) ==")
-    board = "game"
-    r.delete(f"rank:{board}")
-    add_score(board, "alice", 30)
-    add_score(board, "bob", 50)
-    add_score(board, "carol", 40)
-    print(top_n(board, 3))  # [('bob', 50.0), ('carol', 40.0), ('alice', 30.0)]
