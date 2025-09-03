@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Generator
 
-
-DB_PATH = Path(__file__).resolve().parents[1] / "products.db"
+from ..core.config import settings
 
 
 @contextmanager
-def db_connection() -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(DB_PATH)
+def get_db_connection() -> Generator[sqlite3.Connection, None, None]:
+    """데이터베이스 연결 컨텍스트 매니저"""
+    conn = sqlite3.connect(settings.DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -20,9 +19,10 @@ def db_connection() -> Generator[sqlite3.Connection, None, None]:
         conn.close()
 
 
-def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with db_connection() as conn:
+def init_database() -> None:
+    """데이터베이스 초기화"""
+    settings.DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with get_db_connection() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS products (
@@ -33,5 +33,3 @@ def init_db() -> None:
             )
             """
         )
-
-
