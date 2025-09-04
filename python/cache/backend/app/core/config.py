@@ -27,6 +27,17 @@ class Settings(BaseSettings):
     HOST: str = "127.0.0.1"
     PORT: int = 8000
     
+    # Redis 설정
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: str = ""
+    
+    # 캐시 설정
+    CACHE_TTL: int = 300  # 5분
+    CACHE_JITTER_PERCENT: int = 10  # TTL ±10% 지터
+    
     @validator("DATABASE_PATH", pre=True)
     def resolve_database_path(cls, v: Path) -> Path:
         """데이터베이스 경로를 절대 경로로 변환"""

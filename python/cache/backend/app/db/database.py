@@ -10,7 +10,7 @@ from ..core.config import settings
 @contextmanager
 def get_db_connection() -> Generator[sqlite3.Connection, None, None]:
     """데이터베이스 연결 컨텍스트 매니저"""
-    conn = sqlite3.connect(settings.DATABASE_PATH)
+    conn = sqlite3.connect(settings.DATABASE_PATH, check_same_thread=False)  # 스레드 안전성 해제 (캐시 테스트용)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
