@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: str = ""
     
     # 캐시 설정
-    CACHE_TTL: int = 300  # 5분
+    CACHE_TTL: int = 3  # 3초 (캐시 스탬피드 테스트용)
     CACHE_JITTER_PERCENT: int = 10  # TTL ±10% 지터
     
     @validator("DATABASE_PATH", pre=True)

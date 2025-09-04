@@ -59,7 +59,7 @@ class CacheManager:
         
         jitter_range = base_ttl * settings.CACHE_JITTER_PERCENT // 100
         jitter = random.randint(-jitter_range, jitter_range)
-        return max(60, base_ttl + jitter)  # 최소 60초 보장
+        return max(1, base_ttl + jitter)  # 최소 1초 보장 (스탬피드 테스트용)
     
     async def get(self, key: str) -> Optional[Any]:
         """캐시에서 데이터 조회"""
