@@ -58,45 +58,50 @@ class ProductService:
         return [Product(**_row_to_product(r)) for r in rows]
     
     async def get_product(self, product_id: int) -> Optional[Product]:
-        """제품 상세 조회 - Cache-Aside 패턴 적용"""
+        """제품 상세 조회 - Singleflight 패턴으로 캐시 스탬피드 방지"""
         cache_key = self._get_cache_key(product_id)
         
-        # 1. 캐시에서 조회 시도
-        cached_data = await cache_manager.get(cache_key)
-        if cached_data is not None:
-            logger.debug(f"Cache hit for product {product_id}")
-            return Product(**cached_data)
-        
-        # 2. 캐시 미스 - DB에서 비동기 조회
-        logger.debug(f"Cache miss for product {product_id}, querying DB")
-        
-        def _query_db():
-            """DB 조회 동기 함수 - 새 연결 사용"""
-            from ..db.database import get_db_connection
-            with get_db_connection() as conn:
-                row = conn.execute(
-                    "SELECT id, name, price, updated_at FROM products WHERE id = ?",
-                    (product_id,),
-                ).fetchone()
-                return row
-        
-        # 동기 DB 작업을 thread executor에서 비동기로 실행
-        try:
-            loop = asyncio.get_event_loop()
-            row = await loop.run_in_executor(None, _query_db)
+        async def _fetch_from_db() -> Optional[dict]:
+            """DB에서 제품 데이터 조회하는 fallback 함수"""
+            logger.debug(f"Fetching product {product_id} from DB")
             
-            if row is None:
-                return None
+            def _query_db():
+                """DB 조회 동기 함수 - 새 연결 사용"""
+                from ..db.database import get_db_connection
+                with get_db_connection() as conn:
+                    row = conn.execute(
+                        "SELECT id, name, price, updated_at FROM products WHERE id = ?",
+                        (product_id,),
+                    ).fetchone()
+                    return row
             
-            # 3. DB 데이터를 캐시에 저장 (정상 조회된 경우에만)
-            product_data = _row_to_product(row)
-            await cache_manager.set(cache_key, product_data)
+            # 동기 DB 작업을 thread executor에서 비동기로 실행
+            try:
+                loop = asyncio.get_event_loop()
+                row = await loop.run_in_executor(None, _query_db)
+                
+                if row is None:
+                    return None
+                
+                # DB 데이터를 딕셔너리로 변환
+                product_data = _row_to_product(row)
+                return product_data
+                
+            except Exception as e:
+                logger.error(f"DB query error for product {product_id}: {e}")
+                # DB 에러 시 예외를 다시 발생시켜 500 에러로 처리
+                raise
+        
+        # Singleflight 패턴으로 캐시 스탬피드 방지
+        product_data = await cache_manager.get_with_singleflight(
+            key=cache_key,
+            fallback=_fetch_from_db
+        )
+        
+        if product_data is None:
+            return None
             
-            return Product(**product_data)
-        except Exception as e:
-            logger.error(f"DB query error for product {product_id}: {e}")
-            # DB 에러 시 캐시에 저장하지 않고 예외를 다시 발생시켜 500 에러로 처리
-            raise
+        return Product(**product_data)
     
     async def update_product(self, product_id: int, product_data: ProductUpdate) -> Optional[Product]:
         """제품 업데이트 - 캐시 무효화 포함"""

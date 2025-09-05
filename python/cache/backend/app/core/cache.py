@@ -3,10 +3,12 @@ Redis 캐시 매니저
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
-from typing import Optional, Any, Dict
+import time
+from typing import Optional, Any, Dict, Callable, Awaitable
 import redis.asyncio as aioredis
 from redis.asyncio import Redis
 
@@ -155,6 +157,85 @@ class CacheManager:
             "errors": 0
         }
         logger.info("Cache metrics reset")
+    
+    async def get_with_singleflight(self, 
+                                   key: str, 
+                                   fallback: Callable[[], Awaitable[Optional[Any]]], 
+                                   ttl: int = None) -> Optional[Any]:
+        """
+        캐시 스탬피드 방지를 위한 Singleflight 패턴 구현
+        Redis 락을 사용하여 하나의 프로세스만 데이터를 재계산하도록 보장
+        """
+        if not self.redis:
+            return await fallback()
+        
+        # 1. 먼저 캐시에서 조회 시도
+        cached_value = await self.get(key)
+        if cached_value is not None:
+            return cached_value
+        
+        # 2. 캐시 미스 - 락 키로 중복 계산 방지
+        lock_key = f"lock:{key}"
+        lock_ttl = 3000  # 3초 (밀리초)
+        
+        try:
+            # 3. Redis SET NX PX 명령으로 락 획득 시도
+            acquired = await self.redis.set(lock_key, "1", nx=True, px=lock_ttl)
+            
+            if acquired:
+                # 락을 획득한 프로세스 - 데이터 재계산 및 캐시 저장
+                logger.debug(f"Lock acquired for key: {key}")
+                try:
+                    # 락 획득 후 다시 한 번 캐시 확인 (다른 프로세스가 이미 저장했을 수 있음)
+                    cached_value = await self.get(key)
+                    if cached_value is not None:
+                        return cached_value
+                    
+                    # 실제 데이터 재계산
+                    value = await fallback()
+                    if value is not None:
+                        # 캐시에 저장
+                        await self.set(key, value, ttl)
+                    return value
+                    
+                finally:
+                    # 락 해제
+                    await self.redis.delete(lock_key)
+                    logger.debug(f"Lock released for key: {key}")
+            else:
+                # 락을 획득하지 못한 프로세스들 - 짧게 대기 후 재시도
+                logger.debug(f"Lock not acquired for key: {key}, waiting...")
+                
+                # 백오프 전략: 50ms ~ 200ms 랜덤 대기
+                max_retries = 10
+                base_delay = 0.05  # 50ms
+                
+                for retry in range(max_retries):
+                    # 지수 백오프 + 지터
+                    delay = base_delay * (2 ** min(retry, 3)) + random.uniform(0, 0.05)
+                    await asyncio.sleep(delay)
+                    
+                    # 캐시에서 다시 조회 시도
+                    cached_value = await self.get(key)
+                    if cached_value is not None:
+                        logger.debug(f"Got value from cache after waiting (retry {retry + 1}): {key}")
+                        return cached_value
+                    
+                    # 락이 해제되었는지 확인
+                    lock_exists = await self.redis.exists(lock_key)
+                    if not lock_exists:
+                        # 락이 해제되었지만 여전히 캐시에 값이 없다면 직접 계산
+                        logger.debug(f"Lock released but no cache value, fallback to direct computation: {key}")
+                        return await fallback()
+                
+                # 최대 재시도 횟수 초과 - fallback으로 직접 계산
+                logger.warning(f"Max retries exceeded for key: {key}, falling back to direct computation")
+                return await fallback()
+                
+        except Exception as e:
+            logger.error(f"Singleflight error for key {key}: {e}")
+            # 에러 발생 시 fallback으로 직접 계산
+            return await fallback()
 
 
 # 전역 캐시 매니저 인스턴스
