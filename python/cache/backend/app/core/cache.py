@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import time
+from datetime import datetime, timezone
 from typing import Optional, Any, Dict, Callable, Awaitable
 import redis.asyncio as aioredis
 from redis.asyncio import Redis
@@ -107,6 +108,95 @@ class CacheManager:
             self.metrics["errors"] += 1
             logger.error(f"Cache set error for key {key}: {e}")
             return False
+    
+    async def set_with_soft_ttl(self, key: str, value: Any, ttl: int = None) -> bool:
+        """Soft TTL과 함께 캐시에 데이터 저장 - 메타데이터 포함"""
+        if not self.redis:
+            return False
+        
+        try:
+            ttl_with_jitter = self._get_ttl_with_jitter(ttl)
+            
+            # Soft TTL을 위한 메타데이터 추가
+            # soft_expiry: 실제 만료 전 75% 지점에서 갱신 시작
+            soft_ttl = int(ttl_with_jitter * 0.75)
+            soft_expiry = datetime.now(timezone.utc).timestamp() + soft_ttl
+            
+            wrapped_value = {
+                "data": value,
+                "soft_expiry": soft_expiry,
+                "created_at": datetime.now(timezone.utc).timestamp()
+            }
+            
+            serialized_value = json.dumps(wrapped_value, ensure_ascii=False, default=str)
+            
+            result = await self.redis.setex(
+                key, 
+                ttl_with_jitter, 
+                serialized_value
+            )
+            
+            if result:
+                self.metrics["sets"] += 1
+                logger.debug(f"Cache SET with Soft TTL: {key} (Hard TTL: {ttl_with_jitter}s, Soft TTL: {soft_ttl}s)")
+                return True
+            return False
+        except Exception as e:
+            self.metrics["errors"] += 1
+            logger.error(f"Cache set with soft TTL error for key {key}: {e}")
+            return False
+    
+    async def get_with_soft_ttl_check(self, key: str) -> tuple[Optional[Any], bool]:
+        """Soft TTL 체크와 함께 캐시에서 데이터 조회
+        
+        Returns:
+            (data, needs_refresh): 데이터와 갱신 필요 여부
+        """
+        if not self.redis:
+            return None, True
+        
+        try:
+            value = await self.redis.get(key)
+            if value is None:
+                self.metrics["misses"] += 1
+                logger.debug(f"Cache MISS: {key}")
+                return None, True
+            
+            # 래핑된 데이터 파싱
+            try:
+                wrapped_data = json.loads(value)
+                if isinstance(wrapped_data, dict) and "data" in wrapped_data:
+                    # Soft TTL 메타데이터가 있는 경우
+                    data = wrapped_data["data"]
+                    soft_expiry = wrapped_data.get("soft_expiry", 0)
+                    current_time = datetime.now(timezone.utc).timestamp()
+                    
+                    # Soft TTL 만료 확인
+                    needs_refresh = current_time > soft_expiry
+                    
+                    self.metrics["hits"] += 1
+                    if needs_refresh:
+                        logger.debug(f"Cache HIT but needs refresh (Soft TTL expired): {key}")
+                    else:
+                        logger.debug(f"Cache HIT: {key}")
+                    
+                    return data, needs_refresh
+                else:
+                    # 일반 데이터 (레거시)
+                    self.metrics["hits"] += 1
+                    logger.debug(f"Cache HIT (legacy format): {key}")
+                    return wrapped_data, False
+                    
+            except json.JSONDecodeError:
+                # JSON 파싱 실패
+                self.metrics["errors"] += 1
+                logger.error(f"Cache data parsing error for key {key}")
+                return None, True
+                
+        except Exception as e:
+            self.metrics["errors"] += 1
+            logger.error(f"Cache get with soft TTL error for key {key}: {e}")
+            return None, True
     
     async def delete(self, key: str) -> bool:
         """캐시에서 데이터 삭제"""
@@ -235,6 +325,125 @@ class CacheManager:
         except Exception as e:
             logger.error(f"Singleflight error for key {key}: {e}")
             # 에러 발생 시 fallback으로 직접 계산
+            return await fallback()
+    
+    async def get_with_soft_ttl_and_singleflight(self, 
+                                                key: str, 
+                                                fallback: Callable[[], Awaitable[Optional[Any]]], 
+                                                ttl: int = None,
+                                                refresh_probability: float = 0.1) -> Optional[Any]:
+        """
+        Soft TTL + Singleflight 조합 패턴
+        
+        1. 캐시 조회
+        2. Soft TTL 만료 확인 
+        3. 확률적 백그라운드 갱신 또는 즉시 갱신
+        4. Singleflight로 중복 갱신 방지
+        """
+        if not self.redis:
+            return await fallback()
+        
+        # 1. Soft TTL 체크와 함께 캐시 조회
+        cached_data, needs_refresh = await self.get_with_soft_ttl_check(key)
+        
+        if cached_data is not None and not needs_refresh:
+            # 캐시 히트, 갱신 불필요
+            return cached_data
+        
+        if cached_data is not None and needs_refresh:
+            # Soft TTL 만료 - 확률적 백그라운드 갱신
+            should_refresh = random.random() < refresh_probability
+            
+            if should_refresh:
+                # 선택된 요청이 백그라운드 갱신 수행
+                logger.debug(f"Soft TTL expired, triggering background refresh for: {key}")
+                asyncio.create_task(self._background_refresh(key, fallback, ttl))
+            else:
+                logger.debug(f"Soft TTL expired, but skipping refresh (probability): {key}")
+            
+            # 기존 데이터를 즉시 반환 (stale-while-revalidate)
+            return cached_data
+        
+        # 캐시 미스 - Singleflight로 처리
+        logger.debug(f"Cache miss, using singleflight for: {key}")
+        value = await self._singleflight_fetch_and_store(key, fallback, ttl)
+        return value
+    
+    async def _background_refresh(self, 
+                                 key: str, 
+                                 fallback: Callable[[], Awaitable[Optional[Any]]], 
+                                 ttl: int = None):
+        """백그라운드에서 캐시 갱신"""
+        try:
+            logger.debug(f"Background refresh starting for: {key}")
+            value = await fallback()
+            if value is not None:
+                await self.set_with_soft_ttl(key, value, ttl)
+                logger.debug(f"Background refresh completed for: {key}")
+        except Exception as e:
+            logger.error(f"Background refresh failed for key {key}: {e}")
+    
+    async def _singleflight_fetch_and_store(self, 
+                                           key: str, 
+                                           fallback: Callable[[], Awaitable[Optional[Any]]], 
+                                           ttl: int = None) -> Optional[Any]:
+        """Singleflight 패턴으로 데이터 가져와서 Soft TTL로 저장"""
+        lock_key = f"lock:{key}"
+        lock_ttl = 3000  # 3초 (밀리초)
+        
+        try:
+            # Redis SET NX PX 명령으로 락 획득 시도
+            acquired = await self.redis.set(lock_key, "1", nx=True, px=lock_ttl)
+            
+            if acquired:
+                # 락을 획득한 프로세스
+                logger.debug(f"Lock acquired for key: {key}")
+                try:
+                    # 락 획득 후 다시 한 번 캐시 확인
+                    cached_data, _ = await self.get_with_soft_ttl_check(key)
+                    if cached_data is not None:
+                        return cached_data
+                    
+                    # 실제 데이터 재계산
+                    value = await fallback()
+                    if value is not None:
+                        # Soft TTL로 캐시에 저장
+                        await self.set_with_soft_ttl(key, value, ttl)
+                    return value
+                    
+                finally:
+                    # 락 해제
+                    await self.redis.delete(lock_key)
+                    logger.debug(f"Lock released for key: {key}")
+            else:
+                # 락을 획득하지 못한 프로세스들 - 백오프 대기
+                logger.debug(f"Lock not acquired for key: {key}, waiting...")
+                
+                max_retries = 10
+                base_delay = 0.05  # 50ms
+                
+                for retry in range(max_retries):
+                    delay = base_delay * (2 ** min(retry, 3)) + random.uniform(0, 0.05)
+                    await asyncio.sleep(delay)
+                    
+                    # 캐시에서 다시 조회 시도
+                    cached_data, _ = await self.get_with_soft_ttl_check(key)
+                    if cached_data is not None:
+                        logger.debug(f"Got value from cache after waiting (retry {retry + 1}): {key}")
+                        return cached_data
+                    
+                    # 락이 해제되었는지 확인
+                    lock_exists = await self.redis.exists(lock_key)
+                    if not lock_exists:
+                        logger.debug(f"Lock released but no cache value, fallback: {key}")
+                        return await fallback()
+                
+                # 최대 재시도 횟수 초과
+                logger.warning(f"Max retries exceeded for key: {key}, falling back")
+                return await fallback()
+                
+        except Exception as e:
+            logger.error(f"Singleflight with soft TTL error for key {key}: {e}")
             return await fallback()
 
 

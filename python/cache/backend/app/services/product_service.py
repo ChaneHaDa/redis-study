@@ -92,10 +92,11 @@ class ProductService:
                 # DB 에러 시 예외를 다시 발생시켜 500 에러로 처리
                 raise
         
-        # Singleflight 패턴으로 캐시 스탬피드 방지
-        product_data = await cache_manager.get_with_singleflight(
+        # Soft TTL + Singleflight 패턴으로 캐시 스탬피드 방지 + 백그라운드 갱신
+        product_data = await cache_manager.get_with_soft_ttl_and_singleflight(
             key=cache_key,
-            fallback=_fetch_from_db
+            fallback=_fetch_from_db,
+            refresh_probability=0.1  # 10% 확률로 백그라운드 갱신
         )
         
         if product_data is None:
