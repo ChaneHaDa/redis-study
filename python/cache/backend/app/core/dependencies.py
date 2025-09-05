@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from typing import Generator
+from typing import AsyncGenerator
 
-from sqlite3 import Connection
+import aiomysql
 
 from .config import settings
 from ..db.database import get_db_connection
 
 
-def get_database() -> Generator[Connection, None, None]:
+async def get_database() -> AsyncGenerator[aiomysql.Connection, None]:
     """데이터베이스 연결 의존성"""
-    with get_db_connection() as conn:
+    async with get_db_connection() as conn:
         yield conn

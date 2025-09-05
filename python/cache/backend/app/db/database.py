@@ -1,35 +1,50 @@
 from __future__ import annotations
 
-import sqlite3
-from contextlib import contextmanager
-from typing import Generator
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
+import aiomysql
+import asyncio
 from ..core.config import settings
 
 
-@contextmanager
-def get_db_connection() -> Generator[sqlite3.Connection, None, None]:
+@asynccontextmanager
+async def get_db_connection() -> AsyncGenerator[aiomysql.Connection, None]:
     """데이터베이스 연결 컨텍스트 매니저"""
-    conn = sqlite3.connect(settings.DATABASE_PATH, check_same_thread=False)  # 스레드 안전성 해제 (캐시 테스트용)
-    conn.row_factory = sqlite3.Row
+    conn = None
     try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def init_database() -> None:
-    """데이터베이스 초기화"""
-    settings.DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with get_db_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                price REAL NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            )
-            """
+        conn = await aiomysql.connect(
+            host=settings.MYSQL_HOST,
+            port=settings.MYSQL_PORT,
+            user=settings.MYSQL_USER,
+            password=settings.MYSQL_PASSWORD,
+            db=settings.MYSQL_DATABASE,
+            charset='utf8mb4',
+            autocommit=False
         )
+        yield conn
+        if conn:
+            await conn.commit()
+    except Exception as e:
+        if conn:
+            await conn.rollback()
+        raise e
+    finally:
+        if conn:
+            conn.close()  # aiomysql의 close()는 동기 메서드입니다
+
+
+async def init_database() -> None:
+    """데이터베이스 초기화"""
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS products (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    price DECIMAL(10, 2) NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+                """
+            )

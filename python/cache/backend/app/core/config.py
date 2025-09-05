@@ -19,9 +19,13 @@ class Settings(BaseSettings):
     # API 설정
     API_V1_STR: str = "/api/v1"
     
-    # 데이터베이스 설정
-    DATABASE_URL: str = "sqlite:///./products.db"
-    DATABASE_PATH: Path = Path(__file__).resolve().parents[3] / "products.db"
+    # 데이터베이스 설정 (MySQL)
+    DATABASE_URL: str = "mysql+aiomysql://cache_user:cache_password@localhost:3306/cache_study"
+    MYSQL_HOST: str = "localhost"
+    MYSQL_PORT: int = 3306
+    MYSQL_USER: str = "cache_user"
+    MYSQL_PASSWORD: str = "cache_password"
+    MYSQL_DATABASE: str = "cache_study"
     
     # 서버 설정
     HOST: str = "127.0.0.1"
@@ -38,10 +42,6 @@ class Settings(BaseSettings):
     CACHE_TTL: int = 3  # 3초 (캐시 스탬피드 테스트용)
     CACHE_JITTER_PERCENT: int = 10  # TTL ±10% 지터
     
-    @validator("DATABASE_PATH", pre=True)
-    def resolve_database_path(cls, v: Path) -> Path:
-        """데이터베이스 경로를 절대 경로로 변환"""
-        return v.resolve()
     
     class Config:
         env_file = ".env"

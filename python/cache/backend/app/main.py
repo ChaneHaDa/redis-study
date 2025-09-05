@@ -17,8 +17,9 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def on_startup() -> None:
         """애플리케이션 시작 시 실행"""
-        init_database()
+        await init_database()
         await cache_manager.connect()
+        await cache_manager.start_queue_processor()  # Write-Behind 큐 처리기 시작
     
     @app.on_event("shutdown")
     async def on_shutdown() -> None:
@@ -33,7 +34,15 @@ def create_app() -> FastAPI:
     @app.get("/metrics")
     def get_cache_metrics() -> dict:
         """캐시 메트릭 엔드포인트"""
-        return cache_manager.get_metrics()
+        metrics = cache_manager.get_metrics()
+        # Write-Behind 큐 정보 추가
+        return {
+            **metrics,
+            "write_patterns": {
+                "current": cache_manager.get_write_pattern().value,
+                "available": ["invalidation", "write_through", "write_behind"]
+            }
+        }
 
     # API v1 라우터 포함
     app.include_router(api_router, prefix=settings.API_V1_STR)

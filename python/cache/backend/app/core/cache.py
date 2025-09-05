@@ -9,6 +9,7 @@ import logging
 import random
 import time
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional, Any, Dict, Callable, Awaitable
 import redis.asyncio as aioredis
 from redis.asyncio import Redis
@@ -16,6 +17,13 @@ from redis.asyncio import Redis
 from .config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class WritePattern(Enum):
+    """쓰기 패턴 모드"""
+    INVALIDATION = "invalidation"    # DB 커밋 후 DEL
+    WRITE_THROUGH = "write_through"  # DB 쓰기 후 바로 SET
+    WRITE_BEHIND = "write_behind"    # 캐시 먼저, DB는 비동기
 
 
 class CacheManager:
@@ -27,8 +35,12 @@ class CacheManager:
             "hits": 0,
             "misses": 0,
             "sets": 0,
-            "errors": 0
+            "errors": 0,
+            "invalidations": 0,
+            "write_through": 0,
+            "write_behind": 0
         }
+        self.write_pattern = WritePattern.INVALIDATION  # 기본값
     
     async def connect(self):
         """Redis 연결 생성"""
@@ -74,7 +86,19 @@ class CacheManager:
             if value is not None:
                 self.metrics["hits"] += 1
                 logger.debug(f"Cache HIT: {key}")
-                return json.loads(value)
+                # 값 파싱 + Soft TTL 래핑 데이터 자동 언래핑
+                try:
+                    parsed = json.loads(value)
+                    # Soft TTL로 저장된 경우 { data, soft_expiry, created_at } 형태
+                    if isinstance(parsed, dict) and "data" in parsed and (
+                        "soft_expiry" in parsed or "created_at" in parsed
+                    ):
+                        return parsed.get("data")
+                    return parsed
+                except json.JSONDecodeError:
+                    # JSON이 아니면 원문 반환 (비정상 케이스)
+                    logger.warning(f"Cache value for key {key} is not valid JSON; returning raw")
+                    return value
             else:
                 self.metrics["misses"] += 1
                 logger.debug(f"Cache MISS: {key}")
@@ -244,7 +268,10 @@ class CacheManager:
             "hits": 0,
             "misses": 0,
             "sets": 0,
-            "errors": 0
+            "errors": 0,
+            "invalidations": 0,
+            "write_through": 0,
+            "write_behind": 0
         }
         logger.info("Cache metrics reset")
     
@@ -445,6 +472,194 @@ class CacheManager:
         except Exception as e:
             logger.error(f"Singleflight with soft TTL error for key {key}: {e}")
             return await fallback()
+    
+    def set_write_pattern(self, pattern: WritePattern):
+        """쓰기 패턴 모드 설정"""
+        self.write_pattern = pattern
+        logger.info(f"Write pattern changed to: {pattern.value}")
+    
+    def get_write_pattern(self) -> WritePattern:
+        """현재 쓰기 패턴 모드 조회"""
+        return self.write_pattern
+    
+    async def handle_write_invalidation(self, key: str) -> bool:
+        """Invalidation 패턴: DB 커밋 후 캐시 삭제"""
+        try:
+            result = await self.delete(key)
+            if result:
+                self.metrics["invalidations"] += 1
+                logger.debug(f"INVALIDATION: Deleted cache key {key}")
+            return result
+        except Exception as e:
+            logger.error(f"Invalidation error for key {key}: {e}")
+            return False
+    
+    async def handle_write_through(self, key: str, value: Any, ttl: int = None) -> bool:
+        """Write-Through 패턴: DB 쓰기 성공 후 바로 캐시 업데이트"""
+        try:
+            result = await self.set_with_soft_ttl(key, value, ttl)
+            if result:
+                self.metrics["write_through"] += 1
+                logger.debug(f"WRITE-THROUGH: Updated cache key {key}")
+            return result
+        except Exception as e:
+            logger.error(f"Write-through error for key {key}: {e}")
+            return False
+    
+    async def handle_write_behind(self, key: str, value: Any, ttl: int = None) -> bool:
+        """Write-Behind 패턴: 먼저 캐시 업데이트, DB는 큐를 통해 비동기"""
+        try:
+            # 1. 캐시 먼저 업데이트
+            cache_result = await self.set_with_soft_ttl(key, value, ttl)
+            
+            # 2. DB 변경사항을 큐에 추가
+            if cache_result:
+                await self._enqueue_db_write(key, value)
+                self.metrics["write_behind"] += 1
+                logger.debug(f"WRITE-BEHIND: Updated cache and enqueued DB write for {key}")
+            
+            return cache_result
+        except Exception as e:
+            logger.error(f"Write-behind error for key {key}: {e}")
+            return False
+    
+    async def _enqueue_db_write(self, key: str, value: Any):
+        """DB 쓰기 작업을 Redis Stream에 큐잉"""
+        if not self.redis:
+            return
+        
+        try:
+            # Redis Stream을 사용한 큐잉
+            stream_name = "db_write_queue"
+            write_task = {
+                "key": key,
+                "value": json.dumps(value, ensure_ascii=False, default=str),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": "update"
+            }
+            
+            await self.redis.xadd(stream_name, write_task)
+            logger.debug(f"Enqueued DB write task for key: {key}")
+            
+        except Exception as e:
+            logger.error(f"Failed to enqueue DB write for key {key}: {e}")
+    
+    async def process_write_behind_queue(self, batch_size: int = 10) -> int:
+        """Write-Behind 큐 처리 - 배치로 DB 쓰기 작업 수행"""
+        if not self.redis:
+            return 0
+        
+        try:
+            stream_name = "db_write_queue"
+            consumer_group = "db_writers"
+            consumer_name = f"worker_{int(time.time())}"
+            
+            # Consumer Group 생성 (이미 존재하면 무시)
+            try:
+                await self.redis.xgroup_create(stream_name, consumer_group, "0", mkstream=True)
+            except:
+                pass  # 이미 존재하는 경우 무시
+            
+            # 메시지 읽기
+            messages = await self.redis.xreadgroup(
+                consumer_group, 
+                consumer_name, 
+                {stream_name: ">"}, 
+                count=batch_size
+            )
+            
+            processed_count = 0
+            for stream, stream_messages in messages:
+                for message_id, fields in stream_messages:
+                    try:
+                        # DB 쓰기 작업 수행 (여기서는 로깅만)
+                        key = fields.get('key')
+                        value = fields.get('value')
+                        logger.debug(f"Processing write-behind task: {key}")
+                        
+                        # 실제 DB 쓰기는 여기서 수행
+                        await self._perform_db_write(key, value)
+                        
+                        # 메시지 ACK
+                        await self.redis.xack(stream_name, consumer_group, message_id)
+                        processed_count += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to process write-behind task {message_id}: {e}")
+            
+            if processed_count > 0:
+                logger.info(f"Processed {processed_count} write-behind tasks")
+            
+            return processed_count
+            
+        except Exception as e:
+            logger.error(f"Error processing write-behind queue: {e}")
+            return 0
+    
+    async def _perform_db_write(self, key: str, value_json: str):
+        """실제 DB 쓰기 작업 수행"""
+        try:
+            value = json.loads(value_json)
+            
+            # 제품 캐시 키 패턴: prod:{id}
+            if key.startswith("prod:"):
+                product_id = int(key.split(":")[1])
+                await self._update_product_in_db(product_id, value)
+                logger.info(f"DB write completed for product {product_id}")
+            else:
+                logger.warning(f"Unknown cache key pattern for DB write: {key}")
+                
+        except Exception as e:
+            logger.error(f"DB write failed for key {key}: {e}")
+    
+    async def _update_product_in_db(self, product_id: int, product_data: dict):
+        """제품 데이터를 MySQL에 업데이트"""
+        from ..db.database import get_db_connection
+        
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cursor:
+                    # 현재 DB의 데이터와 캐시 데이터 비교 후 업데이트
+                    await cursor.execute(
+                        "UPDATE products SET name = %s, price = %s WHERE id = %s",
+                        (product_data.get('name'), product_data.get('price'), product_id)
+                    )
+                    
+                    if cursor.rowcount > 0:
+                        logger.debug(f"DB updated for product {product_id}")
+                    else:
+                        logger.warning(f"No rows updated for product {product_id}")
+                        
+        except Exception as e:
+            logger.error(f"Failed to update product {product_id} in DB: {e}")
+            raise
+    
+    async def start_queue_processor(self):
+        """백그라운드 큐 처리기 시작"""
+        if not self.redis:
+            logger.warning("Redis not connected, cannot start queue processor")
+            return
+        
+        logger.info("Starting Write-Behind queue processor...")
+        
+        async def _process_queue_continuously():
+            """큐를 지속적으로 처리하는 백그라운드 태스크"""
+            while True:
+                try:
+                    processed = await self.process_write_behind_queue(batch_size=5)
+                    if processed == 0:
+                        # 처리할 메시지가 없으면 1초 대기
+                        await asyncio.sleep(1)
+                    else:
+                        # 처리한 메시지가 있으면 즉시 다음 배치 처리
+                        await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Queue processor error: {e}")
+                    await asyncio.sleep(5)  # 에러 시 5초 대기
+        
+        # 백그라운드 태스크로 시작
+        asyncio.create_task(_process_queue_continuously())
+        logger.info("Queue processor started")
 
 
 # 전역 캐시 매니저 인스턴스

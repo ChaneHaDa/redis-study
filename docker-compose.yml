@@ -27,5 +27,28 @@ services:
     mem_limit: 256m
     cpus: 0.25
 
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-study
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: cache_study
+      MYSQL_USER: cache_user
+      MYSQL_PASSWORD: cache_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
 volumes:
   redis-data:
+  mysql-data:

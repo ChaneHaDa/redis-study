@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-products.db에 1만건의 샘플 데이터를 삽입하는 스크립트
+MySQL에 1만건의 샘플 데이터를 삽입하는 스크립트
 """
+import asyncio
 import random
-import sqlite3
 import sys
 from pathlib import Path
+
+import aiomysql
 
 # 상위 모듈들을 import하기 위한 path 설정
 sys.path.append(str(Path(__file__).parent / "backend"))
@@ -34,57 +36,64 @@ def generate_sample_products(count: int = 10000):
         yield (name, price)
 
 
-def insert_sample_data():
-    """샘플 데이터를 데이터베이스에 삽입"""
-    print(f"데이터베이스 경로: {settings.DATABASE_PATH}")
-    
-    # 데이터베이스 파일이 있는지 확인
-    if not settings.DATABASE_PATH.exists():
-        print("데이터베이스 파일이 존재하지 않습니다. 먼저 애플리케이션을 실행하여 데이터베이스를 초기화하세요.")
-        return
-    
-    conn = sqlite3.connect(settings.DATABASE_PATH)
-    cursor = conn.cursor()
+async def insert_sample_data():
+    """샘플 데이터를 MySQL 데이터베이스에 삽입"""
+    print(f"MySQL 연결 정보: {settings.MYSQL_HOST}:{settings.MYSQL_PORT}/{settings.MYSQL_DATABASE}")
     
     try:
-        # 기존 데이터 개수 확인
-        cursor.execute("SELECT COUNT(*) FROM products")
-        existing_count = cursor.fetchone()[0]
-        print(f"기존 데이터 개수: {existing_count}")
+        conn = await aiomysql.connect(
+            host=settings.MYSQL_HOST,
+            port=settings.MYSQL_PORT,
+            user=settings.MYSQL_USER,
+            password=settings.MYSQL_PASSWORD,
+            db=settings.MYSQL_DATABASE,
+            charset='utf8mb4',
+            autocommit=False
+        )
         
-        # 배치 단위로 데이터 삽입 (성능 향상)
-        batch_size = 1000
-        total_inserted = 0
-        
-        print("샘플 데이터 생성 및 삽입 중...")
-        
-        products = list(generate_sample_products(10000))
-        
-        for i in range(0, len(products), batch_size):
-            batch = products[i:i+batch_size]
-            cursor.executemany(
-                "INSERT INTO products (name, price) VALUES (?, ?)",
-                batch
-            )
-            total_inserted += len(batch)
-            print(f"진행률: {total_inserted}/10000 ({total_inserted/100:.1f}%)")
-        
-        conn.commit()
-        
-        # 최종 데이터 개수 확인
-        cursor.execute("SELECT COUNT(*) FROM products")
-        final_count = cursor.fetchone()[0]
-        
-        print(f"\n삽입 완료!")
-        print(f"총 삽입된 데이터: {total_inserted}건")
-        print(f"최종 데이터 개수: {final_count}건")
-        
+        async with conn.cursor() as cursor:
+            # 기존 데이터 개수 확인
+            await cursor.execute("SELECT COUNT(*) FROM products")
+            result = await cursor.fetchone()
+            existing_count = result[0]
+            print(f"기존 데이터 개수: {existing_count}")
+            
+            # 배치 단위로 데이터 삽입 (성능 향상)
+            batch_size = 1000
+            total_inserted = 0
+            
+            print("샘플 데이터 생성 및 삽입 중...")
+            
+            products = list(generate_sample_products(10000))
+            
+            for i in range(0, len(products), batch_size):
+                batch = products[i:i+batch_size]
+                await cursor.executemany(
+                    "INSERT INTO products (name, price) VALUES (%s, %s)",
+                    batch
+                )
+                total_inserted += len(batch)
+                print(f"진행률: {total_inserted}/10000 ({total_inserted/100:.1f}%)")
+            
+            await conn.commit()
+            
+            # 최종 데이터 개수 확인
+            await cursor.execute("SELECT COUNT(*) FROM products")
+            result = await cursor.fetchone()
+            final_count = result[0]
+            
+            print(f"\n삽입 완료!")
+            print(f"총 삽입된 데이터: {total_inserted}건")
+            print(f"최종 데이터 개수: {final_count}건")
+            
     except Exception as e:
         print(f"오류 발생: {e}")
-        conn.rollback()
+        if 'conn' in locals():
+            await conn.rollback()
     finally:
-        conn.close()
+        if 'conn' in locals():
+            conn.close()
 
 
 if __name__ == "__main__":
-    insert_sample_data()
+    asyncio.run(insert_sample_data())

@@ -2,169 +2,243 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from datetime import datetime
 from typing import List, Optional
 
-from ..core.cache import cache_manager
+import aiomysql
+
+from ..core.cache import cache_manager, WritePattern
 from ..models.schemas import Product, ProductCreate, ProductUpdate
 
 logger = logging.getLogger(__name__)
 
 
-def _dict_from_row(row: sqlite3.Row) -> dict:
-    """SQLite Row를 딕셔너리로 변환"""
-    return {key: row[key] for key in row.keys()}
+async def _fetch_one_to_dict(cursor: aiomysql.Cursor) -> Optional[dict]:
+    """MySQL cursor result를 딕셔너리로 변환"""
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    
+    columns = [desc[0] for desc in cursor.description]
+    return dict(zip(columns, row))
 
 
-def _row_to_product(row: sqlite3.Row) -> dict:
-    """SQLite Row를 제품 딕셔너리로 변환"""
-    data = _dict_from_row(row)
-    data["updated_at"] = datetime.fromisoformat(
-        data["updated_at"].replace("Z", "+00:00").replace(" ", "T")
-    )
+async def _fetch_all_to_dicts(cursor: aiomysql.Cursor) -> List[dict]:
+    """MySQL cursor results를 딕셔너리 리스트로 변환"""
+    rows = await cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def _row_to_product_data(row_dict: dict) -> dict:
+    """MySQL row 딕셔너리를 제품 데이터로 변환"""
+    data = row_dict.copy()
+    # MySQL TIMESTAMP를 datetime 객체로 유지 (이미 datetime 객체임)
+    if isinstance(data.get("updated_at"), datetime):
+        data["updated_at"] = data["updated_at"]
     return data
 
 
 class ProductService:
     """제품 관련 비즈니스 로직 서비스"""
     
-    def __init__(self, db_connection: sqlite3.Connection):
+    def __init__(self, db_connection: aiomysql.Connection):
         self.db = db_connection
     
     def _get_cache_key(self, product_id: int) -> str:
         """캐시 키 생성: prod:{id}"""
         return f"prod:{product_id}"
     
-    def create_product(self, product_data: ProductCreate) -> Product:
+    async def create_product(self, product_data: ProductCreate) -> Product:
         """제품 생성"""
-        cur = self.db.execute(
-            "INSERT INTO products (name, price) VALUES (?, ?)", 
-            (product_data.name, product_data.price)
-        )
-        product_id = cur.lastrowid
-        row = self.db.execute(
-            "SELECT id, name, price, updated_at FROM products WHERE id = ?",
-            (product_id,),
-        ).fetchone()
-        assert row is not None
-        return Product(**_row_to_product(row))
+        async with self.db.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO products (name, price) VALUES (%s, %s)", 
+                (product_data.name, product_data.price)
+            )
+            product_id = cursor.lastrowid
+            
+            await cursor.execute(
+                "SELECT id, name, price, updated_at FROM products WHERE id = %s",
+                (product_id,),
+            )
+            row_dict = await _fetch_one_to_dict(cursor)
+            
+        if row_dict is None:
+            raise ValueError(f"Failed to retrieve created product with id {product_id}")
+            
+        return Product(**_row_to_product_data(row_dict))
     
-    def list_products(self) -> List[Product]:
+    async def list_products(self) -> List[Product]:
         """제품 목록 조회"""
-        rows = self.db.execute(
-            "SELECT id, name, price, updated_at FROM products ORDER BY id DESC"
-        ).fetchall()
-        return [Product(**_row_to_product(r)) for r in rows]
+        async with self.db.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id, name, price, updated_at FROM products ORDER BY id DESC"
+            )
+            rows = await _fetch_all_to_dicts(cursor)
+            
+        return [Product(**_row_to_product_data(r)) for r in rows]
     
     async def get_product(self, product_id: int) -> Optional[Product]:
-        """제품 상세 조회 - Singleflight 패턴으로 캐시 스탬피드 방지"""
+        """제품 상세 조회 - 캐시 적용"""
         cache_key = self._get_cache_key(product_id)
         
         async def _fetch_from_db() -> Optional[dict]:
             """DB에서 제품 데이터 조회하는 fallback 함수"""
             logger.debug(f"Fetching product {product_id} from DB")
             
-            def _query_db():
-                """DB 조회 동기 함수 - 새 연결 사용"""
-                from ..db.database import get_db_connection
-                with get_db_connection() as conn:
-                    row = conn.execute(
-                        "SELECT id, name, price, updated_at FROM products WHERE id = ?",
-                        (product_id,),
-                    ).fetchone()
-                    return row
-            
-            # 동기 DB 작업을 thread executor에서 비동기로 실행
             try:
-                loop = asyncio.get_event_loop()
-                row = await loop.run_in_executor(None, _query_db)
-                
-                if row is None:
+                async with self.db.cursor() as cursor:
+                    await cursor.execute(
+                        "SELECT id, name, price, updated_at FROM products WHERE id = %s",
+                        (product_id,),
+                    )
+                    row_dict = await _fetch_one_to_dict(cursor)
+                    
+                if row_dict is None:
                     return None
                 
                 # DB 데이터를 딕셔너리로 변환
-                product_data = _row_to_product(row)
+                product_data = _row_to_product_data(row_dict)
                 return product_data
                 
             except Exception as e:
                 logger.error(f"DB query error for product {product_id}: {e}")
-                # DB 에러 시 예외를 다시 발생시켜 500 에러로 처리
                 raise
         
-        # Soft TTL + Singleflight 패턴으로 캐시 스탬피드 방지 + 백그라운드 갱신
-        product_data = await cache_manager.get_with_soft_ttl_and_singleflight(
-            key=cache_key,
-            fallback=_fetch_from_db,
-            refresh_probability=0.1  # 10% 확률로 백그라운드 갱신
-        )
+        # 1. 캐시에서 조회 시도
+        cached_data = await cache_manager.get(cache_key)
+        logger.info(f"READ: Cache get result for key={cache_key}: {cached_data}")
+        if cached_data is not None:
+            logger.info(f"Cache hit for product {product_id}, returning cached data")
+            return Product(**cached_data)
+        
+        # 2. 캐시 미스 - DB에서 조회
+        logger.debug(f"Cache miss for product {product_id}, querying DB")
+        product_data = await _fetch_from_db()
         
         if product_data is None:
             return None
-            
+        
+        # 3. DB 데이터를 캐시에 저장 (정상 조회된 경우에만)
+        await cache_manager.set(cache_key, product_data)
+        
         return Product(**product_data)
     
-    async def update_product(self, product_id: int, product_data: ProductUpdate) -> Optional[Product]:
-        """제품 업데이트 - 캐시 무효화 포함"""
+    async def update_product(self, product_id: int, product_data: ProductUpdate, write_pattern: WritePattern = None) -> Optional[Product]:
+        """제품 업데이트 - 3가지 쓰기 패턴 지원"""
         fields: list[str] = []
         params: list[object] = []
         
         if product_data.name is not None:
-            fields.append("name = ?")
+            fields.append("name = %s")
             params.append(product_data.name)
         if product_data.price is not None:
-            fields.append("price = ?")
+            fields.append("price = %s")
             params.append(product_data.price)
         
         if not fields:
             return None
             
-        fields.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')")
         params.append(product_id)
+        
+        cache_key = self._get_cache_key(product_id)
+        
+        # 쓰기 패턴 결정 (파라미터로 받거나 전역 설정 사용)
+        current_pattern = write_pattern or cache_manager.get_write_pattern()
+        logger.info(f"Using write pattern: {current_pattern.value} for product {product_id}")
 
-        def _update_db():
-            """DB 업데이트 동기 함수 - 새 연결 사용"""
-            from ..db.database import get_db_connection
-            with get_db_connection() as conn:
-                cur = conn.execute(
-                    f"UPDATE products SET {', '.join(fields)} WHERE id = ?", 
-                    tuple(params)
-                )
-                if cur.rowcount == 0:
-                    return None
-                
-                row = conn.execute(
-                    "SELECT id, name, price, updated_at FROM products WHERE id = ?",
-                    (product_id,),
-                ).fetchone()
-                return row
+        if current_pattern == WritePattern.WRITE_BEHIND:
+            # Write-Behind: 캐시 먼저 업데이트
+            return await self._handle_write_behind_update(product_id, product_data, fields, params, cache_key)
+        else:
+            # Invalidation, Write-Through: DB 먼저 업데이트
+            return await self._handle_db_first_update(product_id, fields, params, cache_key, current_pattern)
+    
+    async def _handle_db_first_update(self, product_id: int, fields: list[str], params: list[object], 
+                                     cache_key: str, pattern: WritePattern) -> Optional[Product]:
+        """DB 먼저 업데이트하는 패턴 (Invalidation, Write-Through)"""
         
-        # 동기 DB 작업을 thread executor에서 비동기로 실행
-        loop = asyncio.get_event_loop()
-        row = await loop.run_in_executor(None, _update_db)
+        async with self.db.cursor() as cursor:
+            await cursor.execute(
+                f"UPDATE products SET {', '.join(fields)} WHERE id = %s", 
+                tuple(params)
+            )
+            
+            if cursor.rowcount == 0:
+                return None
+            
+            await cursor.execute(
+                "SELECT id, name, price, updated_at FROM products WHERE id = %s",
+                (product_id,),
+            )
+            row_dict = await _fetch_one_to_dict(cursor)
         
-        if row is None:
+        if row_dict is None:
             return None
         
-        # 캐시 무효화
-        cache_key = self._get_cache_key(product_id)
-        await cache_manager.delete(cache_key)
-        logger.debug(f"Cache invalidated for product {product_id}")
+        product_data_dict = _row_to_product_data(row_dict)
         
-        return Product(**_row_to_product(row))
+        # 쓰기 패턴에 따른 캐시 처리
+        if pattern == WritePattern.INVALIDATION:
+            # Invalidation: 캐시 삭제
+            await cache_manager.handle_write_invalidation(cache_key)
+            logger.debug(f"INVALIDATION: Cache deleted for product {product_id}")
+            
+        elif pattern == WritePattern.WRITE_THROUGH:
+            # Write-Through: 캐시 업데이트
+            await cache_manager.set(cache_key, product_data_dict)
+            cache_manager.metrics["write_through"] += 1
+            logger.debug(f"WRITE-THROUGH: Cache updated for product {product_id}")
+        
+        return Product(**product_data_dict)
+    
+    async def _handle_write_behind_update(self, product_id: int, product_data: ProductUpdate, 
+                                         fields: list[str], params: list[object], cache_key: str) -> Optional[Product]:
+        """Write-Behind: 캐시 먼저 업데이트, DB는 비동기"""
+        
+        # 1. 기존 데이터 조회 (캐시 우선)
+        cached_data = await cache_manager.get(cache_key)
+        
+        if cached_data is None:
+            # 캐시에 없으면 DB에서 조회
+            async with self.db.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT id, name, price, updated_at FROM products WHERE id = %s",
+                    (product_id,),
+                )
+                row_dict = await _fetch_one_to_dict(cursor)
+            
+            if row_dict is None:
+                return None
+            
+            cached_data = _row_to_product_data(row_dict)
+        
+        # 2. 캐시 데이터 업데이트
+        updated_data = cached_data.copy()
+        if product_data.name is not None:
+            updated_data["name"] = product_data.name
+        if product_data.price is not None:
+            updated_data["price"] = product_data.price
+        updated_data["updated_at"] = datetime.now()
+        
+        # 3. Write-Behind 패턴: 캐시 먼저 업데이트, DB는 큐를 통해 처리
+        cache_result = await cache_manager.handle_write_behind(cache_key, updated_data)
+        logger.info(f"WRITE-BEHIND: Cache updated and DB write queued for key={cache_key}")
+        
+        # 즉시 캐시에서 읽어서 확인
+        verify_cache = await cache_manager.get(cache_key)
+        logger.info(f"WRITE-BEHIND: Cache verification read result={verify_cache}")
+        
+        return Product(**updated_data)
+    
     
     async def delete_product(self, product_id: int) -> bool:
         """제품 삭제 - 캐시 무효화 포함"""
-        def _delete_db():
-            """DB 삭제 동기 함수 - 새 연결 사용"""
-            from ..db.database import get_db_connection
-            with get_db_connection() as conn:
-                cur = conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
-                return cur.rowcount > 0
         
-        # 동기 DB 작업을 thread executor에서 비동기로 실행
-        loop = asyncio.get_event_loop()
-        deleted = await loop.run_in_executor(None, _delete_db)
+        async with self.db.cursor() as cursor:
+            await cursor.execute("DELETE FROM products WHERE id = %s", (product_id,))
+            deleted = cursor.rowcount > 0
         
         if deleted:
             # 캐시 무효화
