@@ -32,3 +32,4 @@ docker-compose down
 
 ## 학습 주제 바로가기
 - Pub/Sub 실습: `python/pubsub/README.md`
+- Streams 실습: `python/streams/README.md`
