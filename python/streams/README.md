@@ -63,6 +63,26 @@
   - `proc:{stream}` 세트로 멱등 처리, 처리 완료 시 ACK
   - 시도 횟수(`attempts:{stream}:{group}`)가 `--max-retries` 초과 시 데드레터 스트림(`dead:{stream}`)으로 이동 후 ACK
 
+예제 6) 파이프라인 적용 워커
+- 배치로 `SADD + XACK`를 묶어 처리량 향상
+- 실행: `python group_consumer_pipeline.py --stream mystream --group mygroup --consumer c1 --batch 100`
+
+예제 7) 파이프라인 적용 리클레이머
+- `XAUTOCLAIM` 결과에 대해 데드레터/ACK/멱등 마킹을 배치 처리
+- 실행: `python group_auto_reclaimer_pipeline.py --stream mystream --group mygroup --consumer repair1 --min-idle 60000 --batch 100`
+
+예제 8) Lua로 처리 후 ACK 원자화(엔트리 ID 기준)
+- 외부 처리 완료 후, Lua로 `SADD proc:{stream} entry_id`와 `XACK`를 원자적으로 실행
+- 실행: `python group_consumer_lua.py --stream mystream --group mygroup --consumer c1`
+
+예제 9) Lua + 비즈니스 키 멱등성(order_id 등)
+- 외부 처리 완료 후, Lua로 `SADD proc-key:{stream}:{field} {value}`와 `XACK`를 원자적으로 실행
+- 실행: `python group_consumer_lua_by_key.py --stream mystream --group mygroup --consumer c1 --field order_id`
+
+예제 10) 비즈니스 키 기반 멱등 워커(간단)
+- 처리 전 `SADD proc-key:{stream}:{field} {value}`로 선점 후 실패 시 `SREM`으로 롤백
+- 실행: `python idempotent_consumer_by_key.py --stream mystream --group mygroup --consumer c1 --field order_id`
+
 ## 운영 팁
 - 보존 정책: `XTRIM MAXLEN ~ N`으로 대략 유지, 또는 `MINID`로 ID 기준 유지.
 - 중복 처리: 네트워크/재시도 환경에서 동일 메시지 처리 대비해 멱등성 고려.
