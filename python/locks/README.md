@@ -54,6 +54,14 @@
 예제 4) DistLock 클래스로 사용
 - 컨텍스트 매니저: `python distlock_demo.py --resource demo --work-ms 3000`
 
+예제 5) 캐시 스탬피드 방지(Blocking)
+- 캐시 미스 시 한 워커만 DB 조회 후 캐시 재빌드, 나머지는 대기 → `python cache_rebuild_blocking.py --key item:1 --cache-ttl 30 --lock-ttl-ms 5000 --timeout-ms 1000 --retry-ms 100 --db-ms 500`
+- 다중 터미널에서 동시에 실행해 단일 진입과 대기/폴링 동작을 관찰
+
+예제 6) Stale-While-Revalidate(SWR)
+- 소프트 TTL 지나면 오래된 값을 즉시 서빙하고, 락으로 1개 워커만 백그라운드 갱신 시도 → `python cache_rebuild_swr.py --key item:1 --soft-ttl 10 --swr-window 10 --db-ms 500`
+- 동일 키 여러 번 호출하면서 fresh→stale→refresh 흐름 확인
+
 ## Hands-on 랩 시나리오
 1) 기본 상호배제 확인
 - 터미널1: `python acquire_blocking.py --resource demo --work-ms 5000`
@@ -66,6 +74,10 @@
 3) 안전 해제 검증
 - 터미널1: `python acquire_once.py --resource demo --work-ms 5000`
 - 중간에 `GET lock:demo`로 토큰 확인 → 다른 토큰으로는 Lua 해제 스크립트가 0을 반환해야 함.
+
+4) 캐시 스탬피드 방어 실습
+- 동시에 `cache_rebuild_blocking.py --key hot:1` 여러 개 실행 → 단 1개만 DB로 가서 SETEX 하고, 나머지는 채워진 캐시를 사용
+- SWR 모드로 `cache_rebuild_swr.py --key hot:2 --soft-ttl 5 --swr-window 10` 반복 실행 → 소프트 만료 후에도 빠른 응답 유지 + 백그라운드 갱신 확인
 
 ## 운영 팁/체크리스트
 - 재시도 정책: `retry + jitter`로 공명/쏠림 회피.
