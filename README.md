@@ -29,3 +29,6 @@ docker-compose down
 ## 포트 정보
 - Redis Server: `localhost:6379`
 - Redis Insight: `http://localhost:5540`
+
+## 학습 주제 바로가기
+- Pub/Sub 실습: `python/pubsub/README.md`
