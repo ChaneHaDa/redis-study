@@ -17,5 +17,11 @@
 - 이벤트 구독: `SUBSCRIBE __keyevent@0__:expired`
 - 테스트: `SET tmp foo EX 1`
 
-참고: `CONFIG RESETSTAT`로 통계 초기화 가능, `CONFIG GET notify-keyspace-events`로 현재 설정 확인 가능.
+## 운영 관련 명령
+- 구독 중 채널 목록: `PUBSUB CHANNELS`
+- 채널별 구독자 수: `PUBSUB NUMSUB chat:room1 chat:room2`
+- 패턴 구독자 수: `PUBSUB NUMPAT`
+- 설정 확인: `CONFIG GET notify-keyspace-events`
+- 통계 초기화: `CONFIG RESETSTAT`
 
+주의: `MONITOR`는 서버 부하가 크므로 개발/장애 분석 시에만 사용.
