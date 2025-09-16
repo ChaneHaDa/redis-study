@@ -1,0 +1,36 @@
+services:
+  redis-master-1:
+    image: redis:7-alpine
+    container_name: redis-master-1
+    ports:
+      - "6380:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  redis-master-2:
+    image: redis:7-alpine
+    container_name: redis-master-2
+    ports:
+      - "6381:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  redis-master-3:
+    image: redis:7-alpine
+    container_name: redis-master-3
+    ports:
+      - "6382:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
